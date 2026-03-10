@@ -1,0 +1,157 @@
+// Inclusion of Arduino functions, INMP441 driver, Fourier Transform calculator for frequency, Bluetooth module, and motors
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <arduinoFFT.h>
+#include <BluetoothSerial.h>
+#include <Freenove_4WD_Car_For_ESP32.h>
+
+BluetoothSerial SerialBT;
+
+
+
+/* Defining Pin-outs for SD, SCK, and WS 
+Notes for how each abbreviation works:
+VDD connected 3.3V power, VDD is for power (DO NOT CONNECT TO >3.3V UNDER ANY CIRCUMSTANCE)
+GND connected to GND, it's ground duh 
+L/R connected to GND = 0V, defaults to left side (no output on right side due to no power)
+SD connected to Port 13, outputs all sound data to ESP32 (make sure to secure in place to get consistent data!)
+SCK connected to Port 14, clock to track rate of data transfer
+WS connected to Port 15, separates data between left and right sides (actual data vs. all zeros) based on SCK
+*/
+#define I2S_SD 13
+#define I2S_SCK 14
+#define I2S_WS 15
+
+// Setting up Fourier Analysis (# of samples for analysis, and frequency of sampling)
+const uint16_t samples = 512; 
+// Sampling frequency of the microphone
+const double samplingFrequency = 16000.0;
+
+// Fourier arrays and test setup
+double vReal[samples];
+double vImag[samples];
+ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, samples, samplingFrequency);
+
+void setup() {
+  // Setting up Bluetooth connection
+  SerialBT.begin("Cart");
+  
+  // Output baud rate initialization (for I2S output, set at 115.2k bit/s)
+  Serial.begin(115200);
+  
+  // Setting up connection between I2S microphone and ESP32
+  i2s_config_t i2s_config = {
+    // Defines relationship between ESP32 and I2S as: ESP32 provides clock rate, I2S acts as a data source
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    // Microphone sample rate per second, matching samplingFrequency above
+    .sample_rate = samplingFrequency,
+    // Output data formatted into a 32-bit data stream (as opposed to 24)
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    // Disregards right channel, left channel only
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    // "Most Significant Bit", makes first bit of data largest value (sort of a place-value system for data)
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    // Prioritizes data transfer of ESP32 Bluetooth over I2S -> ESP32 data output
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    /* NOTE: CHANGING EITHER .DMA WILL AFFECT OUTPUT RATE OF DATA AND RAM USAGE
+      Buffer = count * len (meaning more RAM usage if either are increased)
+      Count changes amount of data stored if ESP32 is busy processing other processes (e.g. Bluetooth data output)
+      Len changes size of data processing (larger = more data stored and processed at once, but with more latency)
+     */
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    // Sets unnecessary features as turned off
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+
+  // Setting up expected data output locations via pins
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = -1, // unneeded
+    .data_in_num = I2S_SD
+  };
+
+  // ESP32 told to use specific integrated I2S processor, allocates RAM for buffer
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  // Starts WS and SCK clocks given above configuration
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+
+  // Motors Setup
+ PCA9685_Setup();
+}
+
+void loop() {
+  // Sets up block of data to analyze
+  int32_t raw_samples[samples];
+  // Keeps track of read bits from incoming data
+  size_t bytes_read;
+
+  // Takes all of data output and reads it
+  esp_err_t result = i2s_read(I2S_NUM_0, &raw_samples, sizeof(raw_samples), &bytes_read, portMAX_DELAY);
+  
+ // IF ALL OF DATA OUTPUT IS READ CORRECTLY (most likely will)
+  if (result == ESP_OK && bytes_read > 0) {
+    // Loop below for all sample values
+    for (int sample_num = 0; sample_num < samples; sample_num++) {
+      // 32-bit data from output rounded to largest 16-bit data value via shifting
+      int16_t audio_value = raw_samples[sample_num] >> 14; 
+      // Stored into arrays for Fourier Analysis (imaginary results disregarded)
+      vReal[sample_num] = (double)audio_value;
+      vImag[sample_num] = 0.0;
+    }
+
+    // Windowing applied to allow more accurate Fourier Analysis 
+    FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+    // Runs the Fourier Analysis on stored
+    FFT.compute(FFTDirection::Forward);
+    // Volume calculated from real and imaginary parts of Analysis
+    FFT.complexToMagnitude();
+
+    // Search for the frequency with most volume and said volume
+    double loudestFreq = 0;
+    double loudestVol= 0;
+    FFT.majorPeak(&loudestFreq, &loudestVol);
+
+    double volDB = 0; 
+    if (loudestVol > 0) {volDB = 20.0 * log10(loudestVol);}
+
+    // Print to Serial Monitor
+    Serial.print("Loudest Frequency: ");
+    Serial.print(abs(loudestFreq));
+    Serial.println(" Hz");
+    Serial.print("Frequency Volume: ");
+    Serial.print(volDB);
+    Serial.println(" dB");
+    Serial.println();
+
+  // Translation to movement, excludes any volumes below 100 dB
+  if(volDB > 100){
+    // de facto "maximum" based at 130 dB, but hard limit is power <= 4095
+    // Case 1: Below C4 + above E0 -> turns left
+    if(loudestFreq <= 261 && loudestFreq >= 20){
+      double leftPower = 1500*(65/loudestFreq)*((volDB-100)/30)+500;
+      if(leftPower > 4095){leftPower = 4095;}
+      Motor_Move(-leftPower, -leftPower, leftPower, leftPower); 
+      }
+    // Case 2: Above C5 -> turns right
+    else if (loudestFreq >= 523){
+      double freqCont = pow(1.00164,loudestFreq-2093);
+      double rightPower = 1500*(freqCont)*((volDB-100)/30)+500;
+      if(rightPower > 4095){rightPower = 4095;}
+      Motor_Move(rightPower, rightPower, -rightPower, -rightPower); 
+      }
+      // Case 3: Between C4 and C5 -> goes straight
+    else{
+      double strPower = 2000*((volDB-100)/30);
+      if(strPower > 4095){strPower = 4095;}
+      Motor_Move(strPower, strPower, strPower, strPower); 
+
+      }
+  }
+
+  }
+
+}
